@@ -1,4 +1,5 @@
 ## new architechture
+
 ## build new neural network to train each batch
 def build_model():
     model = tf.keras.Sequential([
@@ -32,3 +33,70 @@ for b in batch_sizes:
 print("\nBatch-size → final val_loss")
 for b, vl in results.items():
     print(f"  {b:>5} → {vl:.4f}")
+
+
+
+## 2D covoluted neural network model
+import tensorflow as tf
+
+# 1) streamlined feature mapping with reshape + mean  
+def get_feature_mapping(chunksize=64):
+    def compute_features(csi, pos_tachy):
+        # csi: [32, 1024, 2]  →  reshape to [32, 16, 64, 2]
+        n_chunks = csi.shape[1] // chunksize
+        csi_reshaped = tf.reshape(csi, [32, n_chunks, chunksize, 2])
+        # average over the 64 subcarriers → [32, 16, 2]
+        csi_averaged = tf.reduce_mean(csi_reshaped, axis=2)
+        return csi_averaged, pos_tachy
+    return compute_features
+
+training_set_features = (
+    training_set
+    .map(get_feature_mapping(64))
+    .shuffle(100000)
+)
+test_set_features = (
+    test_set
+    .map(get_feature_mapping(64))
+    .shuffle(100000)
+)
+
+# 2) build a Conv2D+Dense model to learn better pooling
+def build_conv_positioning_model(input_shape=(32,16,2)):
+    inp = tf.keras.Input(shape=input_shape)
+
+    # optionally convert real+imag → magnitude & phase channels
+    complex_csi = tf.complex(inp[...,0], inp[...,1])
+    mag   = tf.abs(complex_csi)[..., tf.newaxis]              # [32,16,1]
+    ph    = tf.angle(complex_csi)
+    ph_enc = tf.stack([tf.sin(ph), tf.cos(ph)], axis=-1)      # [32,16,2]
+    x = tf.concat([mag, ph_enc], axis=-1)                     # [32,16,3]
+
+    # Conv layers learn how to pool & mix across antennas/subcarriers
+    x = tf.keras.layers.Conv2D(32, kernel_size=(3,3), padding="same", activation="relu")(x)
+    x = tf.keras.layers.BatchNormalization()(x)
+    x = tf.keras.layers.Conv2D(64, kernel_size=(3,3), strides=(2,2), padding="same", activation="relu")(x)
+    x = tf.keras.layers.BatchNormalization()(x)
+
+    x = tf.keras.layers.Flatten()(x)
+    x = tf.keras.layers.Dense(256, activation="relu")(x)
+    x = tf.keras.layers.Dropout(0.3)(x)
+    x = tf.keras.layers.Dense(128, activation="relu")(x)
+
+    out = tf.keras.layers.Dense(2, activation="linear", name="position")(x)
+    model = tf.keras.Model(inp, out)
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(),
+        loss="mse",
+        metrics=[tf.keras.metrics.MeanAbsoluteError(name="mae")]
+    )
+    return model
+
+# instantiate and train
+nn = build_conv_positioning_model()
+history = nn.fit(
+    training_set_features.batch(256),
+    validation_data=test_set_features.batch(256),
+    epochs=30
+)
+
